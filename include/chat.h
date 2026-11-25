@@ -3,54 +3,38 @@
 #include <string>
 #include <vector>
 
-struct ChatLine
-{
+extern bool AutoScrollEnabled;
+
+struct ChatLine {
     std::string username;
     std::string message;
-    std::string room;
+    std::string timestamp;
 
-    SDL_Texture* nameTexture;
-    SDL_Texture* messageTexture;
+    // TV
     SDL_Texture* avatarTexture;
-
+    SDL_Texture* nameTexture;
+    SDL_Texture* timestampTexture;
+    SDL_Texture* messageTexture;
     int nameHeight;
     int messageHeight;
-    int avatarSize;
 
-    // Constructor
-    ChatLine()
-        : nameTexture(nullptr)
-        , messageTexture(nullptr)
-        , avatarTexture(nullptr)
-        , nameHeight(0)
-        , messageHeight(0)
-        , avatarSize(48) // fixed size like Discord
-    {}
+    // DRC
+    SDL_Texture* drcAvatarTexture;
+    SDL_Texture* drcNameTexture;
+    SDL_Texture* drcTimestampTexture;
+    SDL_Texture* drcMessageTexture;
+    int drcNameHeight;
+    int drcMessageHeight;
 };
-
-struct Room {
-    char name[64];
-    char description[256];
-};
-
-extern Room rooms[100];
-extern int roomCount;
-extern int selectedRoom;
-
-extern std::string currentRoom;
 
 extern std::vector<ChatLine> chatLines;
 extern int chatPosY;
+extern std::string currentRoom;
+extern bool AutoScrollEnabled;
 
-void AddChatLine(SDL_Renderer* renderer,
-                const std::string& username,
-                const std::string& message,
-                const std::string& room,
-                SDL_Texture* avatar,
-                int nameFontSize,
-                int messageFontSize,
-                SDL_Color nameColor,
-                SDL_Color messageColor,
-                int maxWidth);
+void ScrollChatToBottom(int tvChatViewHeight);
 
-void DrawChatBuffer(SDL_Renderer* renderer, int x, int y, float scaleX, float scaleY);
+void AddChatLine(SDL_Renderer* tvRenderer, SDL_Renderer* drcRenderer, const std::string& username, const std::string& message, SDL_Texture* tvAvatar, SDL_Texture* drcAvatar, int nameFontSize, int messageFontSize, SDL_Color nameColor, SDL_Color messageColor, int tvMaxWidth, int tvChatViewHeight, int drcMaxWidth, int drcChatViewHeight, const std::string& timestamp = "");
+
+void DrawChatBuffer(SDL_Renderer* renderer, int x, int y);
+void DrawLatestMessagesDRC(SDL_Renderer* renderer, int x, int topY, int bottomY);

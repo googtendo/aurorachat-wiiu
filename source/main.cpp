@@ -16,9 +16,6 @@
 #include "storage.h"
 #include "scale.h"
 
-// Used in multiple files, so declared here
-// -------------------------
-std::string clientVersion = "6.0";
 
 std::string username = "";
 std::string password = "";
@@ -28,7 +25,11 @@ textSendType currentTextSendType = type_none;
 Scene scene = SELECTION_MENU;
 
 int fontSize = 48;
-int maxWidth = 1920 - 40;
+int maxWidth = 0;
+int chatViewHeight = 0;
+
+int drcMaxWidth = 854 - 20;
+int drcChatViewHeight = 480 - 40;
 
 int sock = ConnectToTCPServer();
 
@@ -46,11 +47,62 @@ SDL_Color tvTextColor = {255, 255, 255, 255};
 // DRC colors
 SDL_Color drcBackgroundColor = {0, 0, 0, 255};
 SDL_Color drcTextColor = {255, 255, 255, 255};
-// -------------------------
 
-// -----------------------
-// Main
-// -----------------------
+static std::vector<std::string> cachedRulesLinesTV;
+static std::vector<std::string> cachedMotdLinesTV;
+static std::vector<std::string> cachedRulesLinesDRC;
+static std::vector<std::string> cachedMotdLinesDRC;
+
+static std::string lastWrappedRules = "";
+static std::string lastWrappedMotd = "";
+
+static std::vector<std::string> WrapRulesText(const std::string& text, int fontSizePx, int wrapWidthPx)
+{
+    std::vector<std::string> outLines;
+
+    int approxCharWidth = fontSizePx / 2;
+    if (approxCharWidth < 1) approxCharWidth = 1;
+    size_t maxCharsPerLine = (size_t)(wrapWidthPx / approxCharWidth);
+    if (maxCharsPerLine < 10) maxCharsPerLine = 10;
+
+    size_t start = 0;
+    while (start <= text.size())
+    {
+        size_t nl = text.find('\n', start);
+        std::string rawLine = (nl == std::string::npos)
+            ? text.substr(start)
+            : text.substr(start, nl - start);
+
+        // word-wrap
+        size_t pos = 0;
+        while (pos < rawLine.size())
+        {
+            size_t remaining = rawLine.size() - pos;
+            size_t take = std::min(maxCharsPerLine, remaining);
+
+            if (take < remaining)
+            {
+                size_t lastSpace = rawLine.rfind(' ', pos + take);
+                if (lastSpace != std::string::npos && lastSpace > pos)
+                    take = lastSpace - pos;
+            }
+
+            outLines.push_back(rawLine.substr(pos, take));
+            pos += take;
+            while (pos < rawLine.size() && rawLine[pos] == ' ') pos++;
+        }
+
+        if (rawLine.empty())
+            outLines.push_back("");
+
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+
+    return outLines;
+}
+
+
 int main(int argc, char **argv)
 {
     WHBProcInit();
@@ -95,8 +147,13 @@ int main(int argc, char **argv)
 
     SDL_GetRendererOutputSize(tvRenderer, &tvWidth, &tvHeight);
 
-    float scaleX = tvWidth / 1920.0f;
-    float scaleY = tvHeight / 1080.0f;
+    scaleX = tvWidth / 1920.0f;
+    scaleY = tvHeight / 1080.0f;
+
+    maxWidth = tvWidth - SX(40);
+    chatViewHeight = tvHeight - SY(80);
+
+    int motdTop = SY(460);
 
     // GamePad Window
     drcWindow = SDL_CreateWindow("DRC",
@@ -110,10 +167,19 @@ int main(int argc, char **argv)
 
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
 
-    if (LoadLogin(username, password) && !username.empty() && !password.empty()) {
+    bool savedAutoLogin;
+    bool savedAutoScroll;
+    if (LoadSettings(savedAutoLogin, savedAutoScroll)) {
+        AutoLoginEnabled = savedAutoLogin;
+        AutoScrollEnabled = savedAutoScroll;
+    }
+
+    if (AutoLoginEnabled && LoadLogin(username, password) && !username.empty() && !password.empty()) {
         if (login_account(username.c_str(), password.c_str())) {
-            fetch_rooms();
-            scene = ROOMS_LIST;
+            join_room("general");
+            request_history("1024");
+            request_motd();
+            scene = MAIN_MENU;
         } else {
             scene = SELECTION_MENU;
         }
@@ -128,20 +194,8 @@ int main(int argc, char **argv)
     LoadAvatars();
 
     SDL_Texture* systemAvatar = LoadImage(tvRenderer, "romfs:/res/system.png");
-    for (int i = 0; i < roomCount; i++) {
-        AddChatLine(
-            tvRenderer,
-            "System",
-            "Welcome!",
-            rooms[i].name,
-            systemAvatar,
-            SF(fontSize),
-            SF(fontSize),
-            tvTextColor,
-            tvTextColor,
-            maxWidth
-        );
-    }
+    SDL_Texture* drcSystemAvatar = LoadImage(drcRenderer, "romfs:/res/system.png");
+    AddChatLine(tvRenderer, drcRenderer, "System", "Welcome!", systemAvatar, drcSystemAvatar, SF(fontSize), SF(fontSize), tvTextColor, tvTextColor, maxWidth, chatViewHeight, drcMaxWidth, drcChatViewHeight);
 
     Uint32 lastTicks = 0;
     const int AXIS_DEADZONE = 8000;  // deadzone for joystick
@@ -159,6 +213,20 @@ int main(int argc, char **argv)
     int Keyboard_Event;
     SDL_WiiUSysWMEventType Keyboard_Ok = SDL_WIIU_SYSWM_SWKBD_OK_FINISH_EVENT;
     SDL_WiiUSysWMEventType Keyboard_Cancel = SDL_WIIU_SYSWM_SWKBD_CANCEL_EVENT;
+
+    const char* mainMenu[] = {
+        "Chat",
+        "Rules",
+        "Settings",
+        "Credits"
+    };
+
+    const char* settingsMenu[] = {
+        "Auto-Login",
+        "Auto-Scroll",
+        "Log out",
+        "Back to Main Menu"
+    };
 
     const char* selectionMenu[] = {
         "Create Account",
@@ -179,28 +247,34 @@ int main(int argc, char **argv)
 
     lastTicks = SDL_GetTicks();
     while (WHBProcIsRunning()) {
-        if (scene == CHAT) {
+        if (scene == CHAT || scene == RULES || scene == MAIN_MENU) {
             Uint32 now = SDL_GetTicks();
             float deltaSec = (now - lastTicks) / 1000.0f;
             lastTicks = now;
 
             if (gController) {
                 // ANALOG STICK
-                Sint16 axisY = SDL_GameControllerGetAxis(gController, SDL_CONTROLLER_AXIS_LEFTY);
+                Sint16 axisLeftY = SDL_GameControllerGetAxis(gController, SDL_CONTROLLER_AXIS_LEFTY);
+                Sint16 axisRightY = SDL_GameControllerGetAxis(gController, SDL_CONTROLLER_AXIS_RIGHTY);
+            
+                int* targetPosY = (scene == CHAT) ? &chatPosY : (scene == RULES) ? &rulesScrollY : &motdScrollY;
 
-                if (axisY > AXIS_DEADZONE || axisY < -AXIS_DEADZONE) {
-                    float norm = axisY / 32767.0f;
+                if (axisLeftY > AXIS_DEADZONE || axisLeftY < -AXIS_DEADZONE ||
+                    axisRightY > AXIS_DEADZONE || axisRightY < -AXIS_DEADZONE) {
+                    float norm = axisLeftY / 32767.0f + axisRightY / 32767.0f;
                     float move = norm * MAX_SPEED * deltaSec;
-                    chatPosY -= (int)move;
+                    *targetPosY -= (int)move;
                 }
 
                 // D-PAD
-                if (SDL_GameControllerGetButton(gController, SDL_CONTROLLER_BUTTON_DPAD_UP)) {
-                    chatPosY += (int)(MAX_SPEED * deltaSec);
-                }
+                if (scene != MAIN_MENU) {
+                    if (SDL_GameControllerGetButton(gController, SDL_CONTROLLER_BUTTON_DPAD_UP)) {
+                        *targetPosY += (int)(MAX_SPEED * deltaSec);
+                    }
 
-                if (SDL_GameControllerGetButton(gController, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) {
-                    chatPosY -= (int)(MAX_SPEED * deltaSec);
+                    if (SDL_GameControllerGetButton(gController, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) {
+                        *targetPosY -= (int)(MAX_SPEED * deltaSec);
+                    }
                 }
             }
         }
@@ -218,13 +292,21 @@ int main(int argc, char **argv)
                         if (currentTextSendType == type_message && !textBuffer.empty()) {
                             strncpy(input, textBuffer.c_str(), sizeof(input) - 1);
                             input[sizeof(input) - 1] = '\0';
-                            send_chat(currentRoom, input);
+                            send_chat(input);
                         }
                         else if (currentTextSendType == type_username) {
                             username = textBuffer;
                         }
                         else if (currentTextSendType == type_password) {
                             password = textBuffer;
+                        }
+                        else if (currentTextSendType == type_room && !textBuffer.empty()) {
+                            join_room(textBuffer.c_str());
+                            currentRoom = textBuffer;
+                            chatLines.clear();
+                            chatPosY = 0;
+                            AddChatLine(tvRenderer, drcRenderer, "System", ("Room changed to " + textBuffer).c_str(), systemAvatar, drcSystemAvatar, SF(fontSize), SF(fontSize), tvTextColor, tvTextColor, maxWidth, chatViewHeight, drcMaxWidth, drcChatViewHeight);
+                            request_history("1024");
                         }
                     }
                     textBuffer.clear();
@@ -235,7 +317,35 @@ int main(int argc, char **argv)
         }
 
         // Handle incoming messages
-        TryReceive(&sock, tvRenderer, SF(fontSize), tvTextColor, maxWidth);
+        TryReceive(&sock, tvRenderer, drcRenderer, SF(fontSize), tvTextColor, maxWidth, chatViewHeight, drcMaxWidth, drcChatViewHeight);
+
+        if (expectingHistory && (SDL_GetTicks() - lastHistoryMsgTicks > 300)) {
+            expectingHistory = false;
+        }
+
+        if (lastWrappedRules != serverRules) {
+            int tvLineFontSize = SF(36);
+            int tvWrapWidth = tvWidth - SX(80);
+            cachedRulesLinesTV = WrapRulesText(serverRules.empty() ? "No rules provided." : serverRules, tvLineFontSize, tvWrapWidth);
+
+            int drcLineFontSize = 18;
+            int drcWrapWidth = 854 - 60;
+            cachedRulesLinesDRC = WrapRulesText(serverRules.empty() ? "No rules provided." : serverRules, drcLineFontSize, drcWrapWidth);
+
+            lastWrappedRules = serverRules;
+        }
+
+        if (lastWrappedMotd != serverMOTD) {
+            int tvLineFontSize = SF(32);
+            int tvWrapWidth = tvWidth - SX(80);
+            cachedMotdLinesTV = WrapRulesText(serverMOTD.empty() ? "No MOTD provided." : serverMOTD, tvLineFontSize, tvWrapWidth);
+
+            int drcLineFontSize = 18;
+            int drcWrapWidth = 854 - 60;
+            cachedMotdLinesDRC = WrapRulesText(serverMOTD.empty() ? "No MOTD provided." : serverMOTD, drcLineFontSize, drcWrapWidth);
+
+            lastWrappedMotd = serverMOTD;
+        }
 
         // Render TV Screen
         if (tvRenderer) {
@@ -245,179 +355,212 @@ int main(int argc, char **argv)
             if (bgTexture) {
                 SDL_RenderCopy(tvRenderer, bgTexture, NULL, NULL);
             } else {
-                SDL_SetRenderDrawColor(tvRenderer,
-                    tvBackgroundColor.r,
-                    tvBackgroundColor.g,
-                    tvBackgroundColor.b,
-                    tvBackgroundColor.a);
+                SDL_SetRenderDrawColor(tvRenderer, tvBackgroundColor.r, tvBackgroundColor.g, tvBackgroundColor.b, tvBackgroundColor.a);
                 SDL_RenderClear(tvRenderer);
             }
 
             if (scene == SIGN_UP || scene == SIGN_IN) {
                 const int authMenuCount = 3;
-                        
+
                 for (int i = 0; i < authMenuCount; i++) {
                     // Highlight selected item
                     if (authMenuIndex == i) {
-                    
-                        SDL_Rect highlightRect = {
-                            0,
-                            SY(180 + (60 * i)),
-                            tvWidth,
-                            SY(56)
-                        };
-                    
-                        SDL_SetRenderDrawBlendMode(
-                            tvRenderer,
-                            SDL_BLENDMODE_BLEND
-                        );
-                    
-                        SDL_SetRenderDrawColor(
-                            tvRenderer,
-                            0, 0, 0, 180
-                        );
-                    
-                        SDL_RenderFillRect(
-                            tvRenderer,
-                            &highlightRect
-                        );
+
+                        SDL_Rect highlightRect = { 0, SY(180 + (60 * i)), tvWidth, SY(56) };
+
+                        SDL_SetRenderDrawBlendMode(tvRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(tvRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(tvRenderer, &highlightRect);
                     }
 
                     if (scene == SIGN_UP) {
-                        DrawText(
-                            tvRenderer,
-                            signUpMenu[i],
-                            SX(40),
-                            SY(180 + (60 * i)),
-                            SF(48),
-                            drcTextColor
-                        );
+                        DrawTextCached(tvRenderer, signUpMenu[i], SX(40), SY(180 + (60 * i)), SF(48), drcTextColor);
                     }
                     else {
-                        DrawText(
-                            tvRenderer,
-                            signInMenu[i],
-                            SX(40),
-                            SY(180 + (60 * i)),
-                            SF(48),
-                            drcTextColor
-                        );
+                        DrawTextCached(tvRenderer, signInMenu[i], SX(40), SY(180 + (60 * i)), SF(48), drcTextColor);
                     }
                 }
             }
 
-            if (scene == SELECTION_MENU) {
-                DrawText(tvRenderer, "Account Setup", SX(450), SY(50), SF(128), tvTextColor);
+            if (scene == MAIN_MENU) {
+                DrawTextCached(tvRenderer, "AuroraChat for Wii U", SX(300), SY(20), SF(128), tvTextColor);
 
-                if (showResponse) {
-                    DrawText(tvRenderer, ("Error: " + authError).c_str(), SX(20), SY(860), SF(64), tvTextColor);
+                const int mainMenuCount = 4;
+
+                for (int i = 0; i < mainMenuCount; i++) {
+                    // Highlight selected item
+                    if (mainMenuIndex == i) {
+                    
+                        SDL_Rect highlightRect = { 0, SY(180 + (60 * i)), tvWidth, SY(56) };
+                    
+                        SDL_SetRenderDrawBlendMode(tvRenderer, SDL_BLENDMODE_BLEND);
+                    
+                        SDL_SetRenderDrawColor(tvRenderer, 0, 0, 0, 180);
+                    
+                        SDL_RenderFillRect(tvRenderer, &highlightRect);
+                    }
+
+                    DrawTextCached(tvRenderer, mainMenu[i], SX(40), SY(180 + (60 * i)), SF(48), tvTextColor);
                 }
 
-                DrawText(tvRenderer, "Move: ↑/↓", SX(20), SY(930), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Select: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Message of the Day:", SX(40), motdTop, SF(36), tvTextColor);
+
+                if (!motdLoaded) {
+                    DrawTextCached(tvRenderer, "Loading MOTD...", SX(40), motdTop + SY(50), SF(36), tvTextColor);
+                } else {
+                    int lineFontSize = SF(32);
+                    int lineHeight = lineFontSize + SY(8);
+
+                    auto& lines = cachedMotdLinesTV;
+
+                    int viewTop = motdTop + SY(50);
+                    int viewBottom = tvHeight - SY(40);
+                    int viewHeight = viewBottom - viewTop;
+
+                    int contentHeight = (int)lines.size() * lineHeight;
+                    int maxScroll = std::max(0, contentHeight - viewHeight);
+
+                    if (motdScrollY > 0) motdScrollY = 0;
+                    if (motdScrollY < -maxScroll) motdScrollY = -maxScroll;
+
+                    SDL_Rect clipRect = { 0, viewTop, tvWidth, viewHeight };
+                    SDL_RenderSetClipRect(tvRenderer, &clipRect);
+
+                    int y = viewTop + motdScrollY;
+                    for (auto& line : lines) {
+                        if (y + lineHeight >= viewTop && y <= viewBottom) {
+                            DrawTextCached(tvRenderer, line, SX(40), y, lineFontSize, tvTextColor);
+                        }
+                        y += lineHeight;
+                    }
+
+                    SDL_RenderSetClipRect(tvRenderer, nullptr);
+                }
+            }
+            else if (scene == SETTINGS) {
+                DrawTextCached(tvRenderer, "Settings", SX(650), SY(20), SF(128), tvTextColor);
+
+                const int settingsMenuCount = 4;
+
+                for (int i = 0; i < settingsMenuCount; i++) {
+                    // Highlight selected item
+                    if (settingsMenuIndex == i) {
+                        SDL_Rect highlightRect = { 0, SY(180 + (60 * i)), tvWidth, SY(56) };
+
+                        SDL_SetRenderDrawBlendMode(tvRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(tvRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(tvRenderer, &highlightRect);
+                    }
+
+                    DrawTextCached(tvRenderer, settingsMenu[i], SX(40), SY(180 + (60 * i)), SF(48), tvTextColor);
+
+                    if (i == 0) {
+                        if (AutoLoginEnabled)
+                            DrawTextCached(tvRenderer, "ON", SX(600), SY(180 + (60 * i)), SF(48), {0, 255, 0, 255});
+                        else
+                            DrawTextCached(tvRenderer, "OFF", SX(600), SY(180 + (60 * i)), SF(48), {255, 0, 0, 255});
+                    }
+                    else if (i == 1) {
+                        if (AutoScrollEnabled)
+                            DrawTextCached(tvRenderer, "ON", SX(600), SY(180 + (60 * i)), SF(48), {0, 255, 0, 255});
+                        else
+                            DrawTextCached(tvRenderer, "OFF", SX(600), SY(180 + (60 * i)), SF(48), {255, 0, 0, 255});
+                    }
+                }
+            }
+            else if (scene == CREDITS) {
+                DrawTextCached(tvRenderer, "AuroraChat for Wii U v7.1", SX(20), SY(20), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Client Developed by Funtum", SX(20), SY(180), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Server Developed by KwTheDsGuy and 3pm", SX(20), SY(260), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Icon and banner by hugh", SX(20), SY(340), SF(64), tvTextColor);
+
+                DrawTextCached(tvRenderer, "Press Ⓑ to go back", SX(20), SY(1000), SF(64), tvTextColor);
+            }
+            else if (scene == SELECTION_MENU) {
+                DrawTextCached(tvRenderer, "Account Setup", SX(450), SY(30), SF(128), tvTextColor);
+
+                if (showResponse) {
+                    DrawTextCached(tvRenderer, ("Error: " + authError).c_str(), SX(20), SY(860), SF(64), tvTextColor);
+                }
+
+                DrawTextCached(tvRenderer, "Move: ↑/↓", SX(20), SY(930), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Select: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
 
                 const int selectionMenuCount = 2;
-                        
+
                 for (int i = 0; i < selectionMenuCount; i++) {
                     // Highlight selected item
                     if (selectionMenuIndex == i) {
-                    
-                        SDL_Rect highlightRect = {
-                            0,
-                            SY(180 + (60 * i)),
-                            tvWidth,
-                            SY(56)
-                        };
-                    
-                        SDL_SetRenderDrawBlendMode(
-                            tvRenderer,
-                            SDL_BLENDMODE_BLEND
-                        );
-                    
-                        SDL_SetRenderDrawColor(
-                            tvRenderer,
-                            0, 0, 0, 180
-                        );
-                    
-                        SDL_RenderFillRect(
-                            tvRenderer,
-                            &highlightRect
-                        );
+                        SDL_Rect highlightRect = { 0, SY(180 + (60 * i)), tvWidth, SY(56) };
+
+                        SDL_SetRenderDrawBlendMode(tvRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(tvRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(tvRenderer, &highlightRect);
                     }
-                
-                    DrawText(
-                        tvRenderer,
-                        selectionMenu[i],
-                        SX(40),
-                        SY(180 + (60 * i)),
-                        SF(48),
-                        tvTextColor
-                    );
+
+                    DrawTextCached(tvRenderer, selectionMenu[i], SX(40), SY(180 + (60 * i)), SF(48), tvTextColor);
                 }
             }
             else if (scene == SIGN_UP) {
-                DrawText(tvRenderer, "Create Account", SX(450), SY(50), SF(128), tvTextColor);
+                DrawTextCached(tvRenderer, "Create Account", SX(450), SY(30), SF(128), tvTextColor);
 
-                DrawText(tvRenderer, "Move: ↑/↓", SX(20), SY(930), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Select: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Move: ↑/↓", SX(20), SY(860), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Select: Ⓐ", SX(20), SY(930), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Press Ⓑ to go back", SX(20), SY(1000), SF(64), tvTextColor);
             }
             else if (scene == SIGN_IN) {
-                DrawText(tvRenderer, "Logging In", SX(550), SY(50), SF(128), tvTextColor);
+                DrawTextCached(tvRenderer, "Logging In", SX(600), SY(30), SF(128), tvTextColor);
 
-                DrawText(tvRenderer, "Move: ↑/↓", SX(20), SY(930), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Select: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Move: ↑/↓", SX(20), SY(860), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Select: Ⓐ", SX(20), SY(930), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Press Ⓑ to go back", SX(20), SY(1000), SF(64), tvTextColor);
             }
-            else if (scene == ROOMS_LIST) {
-                DrawText(tvRenderer, "Rooms", SX(700), SY(50), SF(128), tvTextColor);
+            else if (scene == RULES) {
+                DrawTextCached(tvRenderer, "Server Rules", SX(600), SY(30), SF(96), tvTextColor);
 
-                DrawText(tvRenderer, "Move: ↑/↓", SX(20), SY(860), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Log out: Ⓑ", SX(20), SY(930), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Select: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
+                if (!rulesLoaded) {
+                    DrawTextCached(tvRenderer, "Loading rules...", SX(450), SY(200), SF(128), tvTextColor);
+                } else {
+                    int lineFontSize = SF(36);
+                    int lineHeight = lineFontSize + SY(8);
+                
+                    auto& lines = cachedRulesLinesTV;
 
-                for (int i = 0; i < roomCount; i++) {
+                    int viewTop = SY(180);
+                    int viewBottom = tvHeight - SY(160);
+                    int viewHeight = viewBottom - viewTop;
 
-                    // Highlight selected room
-                    if (selectedRoom == i) {
+                    int contentHeight = (int)lines.size() * lineHeight;
+                    int maxScroll = std::max(0, contentHeight - viewHeight);
 
-                        SDL_Rect highlightRect = {
-                            0,
-                            SY(180 + (60 * i)),
-                            tvWidth,
-                            SY(56)
-                        };
+                    if (rulesScrollY > 0) rulesScrollY = 0;
+                    if (rulesScrollY < -maxScroll) rulesScrollY = -maxScroll;
 
-                        SDL_SetRenderDrawBlendMode(
-                            tvRenderer,
-                            SDL_BLENDMODE_BLEND
-                        );
+                    SDL_Rect clipRect = { 0, viewTop, tvWidth, viewHeight };
+                    SDL_RenderSetClipRect(tvRenderer, &clipRect);
 
-                        SDL_SetRenderDrawColor(
-                            tvRenderer,
-                            0, 0, 0, 180
-                        );
-
-                        SDL_RenderFillRect(
-                            tvRenderer,
-                            &highlightRect
-                        );
+                    int y = viewTop + rulesScrollY;
+                    for (auto& line : lines) {
+                        if (y + lineHeight >= viewTop && y <= viewBottom) {
+                            DrawTextCached(tvRenderer, line, SX(40), y, lineFontSize, tvTextColor);
+                        }
+                        y += lineHeight;
                     }
 
-                    DrawText(
-                        tvRenderer,
-                        rooms[i].name,
-                        SX(40),
-                        SY(180 + (60 * i)),
-                        SF(48),
-                        tvTextColor
-                    );
+                    SDL_RenderSetClipRect(tvRenderer, nullptr);
                 }
+
+                DrawTextCached(tvRenderer, "Move: ↑/↓", SX(20), SY(930), SF(64), tvTextColor);
+                DrawTextCached(tvRenderer, "Accept & Continue: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
             }
             else if (scene == CHAT) {
-                DrawChatBuffer(tvRenderer, SX(40), SY(40), scaleX, scaleY);
-
-                DrawText(tvRenderer, "Move: ↑/↓", SX(20), SY(860), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Leave: Ⓑ", SX(20), SY(930), SF(64), tvTextColor);
-                DrawText(tvRenderer, "Send a message: Ⓐ", SX(20), SY(1000), SF(64), tvTextColor);
+                DrawChatBuffer(tvRenderer, SX(40), SY(40));
             }
             SDL_RenderPresent(tvRenderer);
         }
@@ -430,182 +573,181 @@ int main(int argc, char **argv)
             if (bgTextureDRC) {
                 SDL_RenderCopy(drcRenderer, bgTextureDRC, NULL, NULL);
             } else {
-                SDL_SetRenderDrawColor(drcRenderer,
-                    drcBackgroundColor.r,
-                    drcBackgroundColor.g,
-                    drcBackgroundColor.b,
-                    drcBackgroundColor.a);
+                SDL_SetRenderDrawColor(drcRenderer, drcBackgroundColor.r, drcBackgroundColor.g, drcBackgroundColor.b, drcBackgroundColor.a);
                 SDL_RenderClear(drcRenderer);
             }
 
             if (scene == SELECTION_MENU) {
                 const int selectionMenuCount = 2;
-                        
+
                 for (int i = 0; i < selectionMenuCount; i++) {
                     // Highlight selected item
                     if (selectionMenuIndex == i) {
-                    
-                        SDL_Rect highlightRect = {
-                            0,
-                            40 * i,
-                            854,
-                            40
-                        };
-                    
-                        SDL_SetRenderDrawBlendMode(
-                            drcRenderer,
-                            SDL_BLENDMODE_BLEND
-                        );
-                    
-                        SDL_SetRenderDrawColor(
-                            drcRenderer,
-                            0, 0, 0, 180
-                        );
-                    
-                        SDL_RenderFillRect(
-                            drcRenderer,
-                            &highlightRect
-                        );
+                        SDL_Rect highlightRect = { 0, 40 * i, 854, 40 };
+
+                        SDL_SetRenderDrawBlendMode(drcRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(drcRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(drcRenderer, &highlightRect);
                     }
-                
-                    DrawText(
-                        drcRenderer,
-                        selectionMenu[i],
-                        20,
-                        40 * i + 4,
-                        32,
-                        drcTextColor
-                    );
+
+                    DrawTextCached(drcRenderer, selectionMenu[i], 20, 40 * i + 4, 32, drcTextColor);
                 }
             }
             else if (scene == SIGN_UP || scene == SIGN_IN) {
                 const int authMenuCount = 3;
-                        
+
                 for (int i = 0; i < authMenuCount; i++) {
                     // Highlight selected item
                     if (authMenuIndex == i) {
-                    
-                        SDL_Rect highlightRect = {
-                            0,
-                            40 * i,
-                            854,
-                            40
-                        };
-                    
-                        SDL_SetRenderDrawBlendMode(
-                            drcRenderer,
-                            SDL_BLENDMODE_BLEND
-                        );
-                    
-                        SDL_SetRenderDrawColor(
-                            drcRenderer,
-                            0, 0, 0, 180
-                        );
-                    
-                        SDL_RenderFillRect(
-                            drcRenderer,
-                            &highlightRect
-                        );
+                        SDL_Rect highlightRect = { 0, 40 * i, 854, 40 };
+
+                        SDL_SetRenderDrawBlendMode(drcRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(drcRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(drcRenderer, &highlightRect);
                     }
 
                     if (scene == SIGN_UP) {
-                        DrawText(
-                            drcRenderer,
-                            signUpMenu[i],
-                            20,
-                            40 * i + 4,
-                            32,
-                            drcTextColor
-                        );
+                        DrawTextCached(drcRenderer, signUpMenu[i], 20, 40 * i + 4, 32, drcTextColor);
                     }
                     else {
-                        DrawText(
-                            drcRenderer,
-                            signInMenu[i],
-                            20,
-                            40 * i + 4,
-                            32,
-                            drcTextColor
-                        );
+                        DrawTextCached(drcRenderer, signInMenu[i], 20, 40 * i + 4, 32, drcTextColor);
                     }
                 }
             }
-            else if (scene == ROOMS_LIST) {
-                DrawText(
-                    drcRenderer,
-                    ("Logged in as: " + username).c_str(),
-                    10,
-                    420,
-                    48,
-                    drcTextColor
-                );
+            else if (scene == MAIN_MENU) {
+                const int mainMenuCount = 4;
 
-                for (int i = 0; i < roomCount; i++) {
-                
-                    // Highlight selected room
-                    if (selectedRoom == i) {
-                    
-                        SDL_Rect highlightRect = {
-                            0,
-                            40 * i,
-                            854,
-                            40
-                        };
-                    
-                        SDL_SetRenderDrawBlendMode(
-                            drcRenderer,
-                            SDL_BLENDMODE_BLEND
-                        );
-                    
-                        SDL_SetRenderDrawColor(
-                            drcRenderer,
-                            0, 0, 0, 180
-                        );
-                    
-                        SDL_RenderFillRect(
-                            drcRenderer,
-                            &highlightRect
-                        );
+                for (int i = 0; i < mainMenuCount; i++) {
+                    // Highlight selected item
+                    if (mainMenuIndex == i) {
+                        SDL_Rect highlightRect = { 0, 40 * i, 854, 40 };
+
+                        SDL_SetRenderDrawBlendMode(drcRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(drcRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(drcRenderer, &highlightRect);
                     }
-                
-                    DrawText(
-                        drcRenderer,
-                        rooms[i].name,
-                        20,
-                        40 * i + 4,
-                        32,
-                        drcTextColor
-                    );
+
+                    DrawTextCached(drcRenderer, mainMenu[i], 20, 40 * i + 4, 32, drcTextColor);
                 }
+
+                DrawTextCached(drcRenderer, "Message of the Day:", 20, 190, 24, drcTextColor);
+
+                if (!motdLoaded) {
+                    DrawTextCached(drcRenderer, "Loading MOTD...", 20, 220, 20, drcTextColor);
+                } else {
+                    int lineFontSize = 18;
+                    int lineHeight = lineFontSize + 4;
+
+                    auto& lines = cachedMotdLinesDRC;
+
+                    int viewTop = 220;
+                    int viewBottom = 470;
+
+                    SDL_Rect clipRect = { 0, viewTop, 854, viewBottom - viewTop };
+                    SDL_RenderSetClipRect(drcRenderer, &clipRect);
+
+                    int y = viewTop + motdScrollY;
+                    for (auto& line : lines) {
+                        if (y + lineHeight >= viewTop && y <= viewBottom) {
+                            DrawTextCached(drcRenderer, line.c_str(), 20, y, lineFontSize, drcTextColor);
+                        }
+                        y += lineHeight;
+                    }
+
+                    SDL_RenderSetClipRect(drcRenderer, nullptr);
+                }
+            }
+            else if (scene == SETTINGS) {
+                const int settingsMenuCount = 4;
+
+                for (int i = 0; i < settingsMenuCount; i++) {
+                    // Highlight selected item
+                    if (settingsMenuIndex == i) {
+                        SDL_Rect highlightRect = { 0, 40 * i, 854, 40 };
+
+                        SDL_SetRenderDrawBlendMode(drcRenderer, SDL_BLENDMODE_BLEND);
+
+                        SDL_SetRenderDrawColor(drcRenderer, 0, 0, 0, 180);
+
+                        SDL_RenderFillRect(drcRenderer, &highlightRect);
+                    }
+
+                    DrawTextCached(drcRenderer, settingsMenu[i], 20, 40 * i, 36, drcTextColor);
+
+                    if (i == 0) {
+                        if (AutoLoginEnabled)
+                            DrawTextCached(drcRenderer, "ON", 300, 40 * i, 36, {0, 255, 0, 255});
+                        else
+                            DrawTextCached(drcRenderer, "OFF", 300, 40 * i, 36, {255, 0, 0, 255});
+                    }
+                    else if (i == 1) {
+                        if (AutoScrollEnabled)
+                            DrawTextCached(drcRenderer, "ON", 300, 40 * i, 36, {0, 255, 0, 255});
+                        else
+                            DrawTextCached(drcRenderer, "OFF", 300, 40 * i, 36, {255, 0, 0, 255});
+                    }
+                }
+            }
+            else if (scene == CREDITS) {
+                DrawTextCached(drcRenderer, "AuroraChat for Wii U v7.1", 10, 10, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Client Developed by Funtum", 10, 90, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Server Developed by KwTheDsGuy and 3pm", 10, 130, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Icon and banner by hugh", 10, 170, 32, drcTextColor);
+
+                DrawTextCached(drcRenderer, "Press Ⓑ to go back", 10, 440, 32, drcTextColor);
+            }
+            else if (scene == SIGN_UP || scene == SIGN_IN) {
+                DrawTextCached(drcRenderer, "Enter text using the on-screen keyboard.", 20, 20, 32, drcTextColor);
+            }
+            else if (scene == RULES) {
+                DrawTextCached(drcRenderer, "Server Rules", 250, 10, 48, drcTextColor);
+
+                if (!rulesLoaded) {
+                    DrawTextCached(drcRenderer, "Loading rules...", 10, 60, 24, drcTextColor);
+                } else {
+                    int lineFontSize = 18;
+                    int lineHeight = lineFontSize + 4;
+
+                    auto& lines = cachedRulesLinesDRC;
+
+                    int viewTop = 60;
+                    int viewBottom = 400;
+
+                    SDL_Rect clipRect = { 0, viewTop, 854, viewBottom - viewTop };
+                    SDL_RenderSetClipRect(drcRenderer, &clipRect);
+
+                    int y = viewTop + rulesScrollY;
+                    for (auto& line : lines) {
+                        if (y + lineHeight >= viewTop && y <= viewBottom) {
+                            DrawTextCached(drcRenderer, line.c_str(), 10, y, lineFontSize, drcTextColor);
+                        }
+                        y += lineHeight;
+                    }
+
+                    SDL_RenderSetClipRect(drcRenderer, nullptr);
+                }
+
+                DrawTextCached(drcRenderer, "Move: ↑/↓", 10, 400, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Accept & Continue: Ⓐ", 10, 440, 32, drcTextColor);
             }
             else if (scene == CHAT) {
-                DrawText(
-                    drcRenderer,
-                    currentRoom.c_str(),
-                    20,
-                    20,
-                    64,
-                    drcTextColor
-                );
+                DrawTextCached(drcRenderer, ("Username: " + username).c_str(), 10, 10, 32, drcTextColor);
+                DrawTextCached(drcRenderer, ("Room: " + currentRoom).c_str(), 10, 45, 32, drcTextColor);
 
-                DrawText(
-                    drcRenderer,
-                    ("Logged in as: " + username).c_str(),
-                    10,
-                    380,
-                    48,
-                    drcTextColor
-                );
+                DrawLatestMessagesDRC(drcRenderer, 10, 90, 300);
 
-                DrawText(
-                    drcRenderer,
-                    "Press A to type a message...",
-                    10,
-                    440,
-                    32,
-                    drcTextColor
-                );
+                DrawTextCached(drcRenderer, "Move: ↑/↓", 10, 320, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Leave: Ⓑ", 10, 360, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Change room: Ⓨ", 10, 400, 32, drcTextColor);
+                DrawTextCached(drcRenderer, "Send a message: Ⓐ", 10, 440, 32, drcTextColor);
             }
+
             SDL_RenderPresent(drcRenderer);
         }
     }
@@ -613,6 +755,10 @@ int main(int argc, char **argv)
     if (sock >= 0) {
         shutdown(sock, SHUT_RDWR);
         close(sock);
+    }
+
+    if (!AutoLoginEnabled) {
+        ClearLogin();
     }
 
     if (gController)
@@ -625,6 +771,8 @@ int main(int argc, char **argv)
 
     if (systemAvatar)
         SDL_DestroyTexture(systemAvatar);
+    if (drcSystemAvatar)
+        SDL_DestroyTexture(drcSystemAvatar);
 
     if (drcRenderer)
         SDL_DestroyRenderer(drcRenderer);
@@ -636,6 +784,7 @@ int main(int argc, char **argv)
         SDL_DestroyWindow(tvWindow);
 
     DestroyAvatars();
+    ClearTextCache();
     IMG_Quit();
     FreeFonts();
     TTF_Quit();

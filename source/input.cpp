@@ -3,8 +3,12 @@
 #include "net.h"
 #include "storage.h"
 
+int mainMenuIndex = 0;
+int settingsMenuIndex = 0;
 int selectionMenuIndex = 0;
 int authMenuIndex = 0;
+
+bool AutoLoginEnabled = true;
 
 void handle_button_down(const SDL_ControllerButtonEvent& e)
 {
@@ -20,8 +24,114 @@ void handle_button_down(const SDL_ControllerButtonEvent& e)
                     SDL_StartTextInput();
                 }
             }
+            if (e.button == SDL_CONTROLLER_BUTTON_B) {
+                request_motd();
+                scene = MAIN_MENU;
+            }
+            if (e.button == SDL_CONTROLLER_BUTTON_Y) {
+                if (!connectionLost) {
+                    currentTextSendType = type_room;
+                    SDL_WiiUSetSWKBDHintText("Enter a room name...\nYou can also DM a user with @[username]\nBoth users need to do this to DM each other.");
+                    SDL_StartTextInput();
+                }
+            }
+        }
+        else if (scene == RULES) {
+            if (e.button == SDL_CONTROLLER_BUTTON_A) {
+                ScrollChatToBottom(chatViewHeight);
+                scene = CHAT;
+            }
+        }
+        else if (scene == SETTINGS) {
+            if (e.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+                settingsMenuIndex--;
+                if (settingsMenuIndex < 0)
+                    settingsMenuIndex = 3;
+            }
+            else if (e.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+                settingsMenuIndex++;
+                if (settingsMenuIndex > 3)
+                    settingsMenuIndex = 0;
+            }
+            else if (e.button == SDL_CONTROLLER_BUTTON_A) {
+                switch (settingsMenuIndex) {
+                    case 0:
+                        AutoLoginEnabled = !AutoLoginEnabled;
+                        SaveSettings(AutoLoginEnabled, AutoScrollEnabled);
+                        break;
+
+                    case 1:
+                        AutoScrollEnabled = !AutoScrollEnabled;
+                        SaveSettings(AutoLoginEnabled, AutoScrollEnabled);
+                        break;
+
+                    case 2:
+                        part_room();
+                        ClearLogin();
+                        username.clear();
+                        password.clear();
+                        chatLines.clear();
+                        chatPosY = 0;
+                        currentRoom = "general";
+                        settingsMenuIndex = 0;
+                        scene = SELECTION_MENU;
+                        break;
+
+                    case 3:
+                        request_motd();
+                        scene = MAIN_MENU;
+                        break;
+                }
+            }
             else if (e.button == SDL_CONTROLLER_BUTTON_B) {
-                scene = ROOMS_LIST;
+                request_motd();
+                scene = MAIN_MENU;
+            }
+        }
+        else if (scene == CREDITS) {
+            if (e.button == SDL_CONTROLLER_BUTTON_B) {
+                request_motd();
+                scene = MAIN_MENU;
+            }
+        }
+        else if (scene == MAIN_MENU) {
+            if (e.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+
+                mainMenuIndex--;
+
+                if (mainMenuIndex < 0)
+                    mainMenuIndex = 3;
+            }
+
+            else if (e.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+
+                mainMenuIndex++;
+
+                if (mainMenuIndex > 3)
+                    mainMenuIndex = 0;
+            }
+
+            else if (e.button == SDL_CONTROLLER_BUTTON_A) {
+
+                switch (mainMenuIndex) {
+
+                    case 0:
+                        ScrollChatToBottom(chatViewHeight);
+                        scene = CHAT;
+                        break;
+
+                    case 1:
+                        scene = RULES;
+                        request_rules();
+                        break;
+
+                    case 2:
+                        scene = SETTINGS;
+                        break;
+                    case 3:
+                        scene = CREDITS;
+                        break;
+                }
             }
         }
         else if (scene == SELECTION_MENU) {
@@ -83,7 +193,6 @@ void handle_button_down(const SDL_ControllerButtonEvent& e)
                         SDL_WiiUSetSWKBDInitialText(username.c_str());
                         SDL_WiiUSetSWKBDHintText("Enter a username...");
                         SDL_StartTextInput();
-                        authMenuIndex = 0;
                         break;
 
                     case 1:
@@ -110,8 +219,11 @@ void handle_button_down(const SDL_ControllerButtonEvent& e)
                         }
 
                         SaveLogin(username.c_str(), password.c_str());
-                        fetch_rooms();
-                        scene = ROOMS_LIST;
+                        join_room("general");
+                        request_rules();
+                        request_history("1024");
+
+                        scene = RULES;
                     }
                     else if (scene == SIGN_IN)
                     {
@@ -124,39 +236,17 @@ void handle_button_down(const SDL_ControllerButtonEvent& e)
                         }
 
                         SaveLogin(username.c_str(), password.c_str());
-                        fetch_rooms();
-                        scene = ROOMS_LIST;
+                        join_room("general");
+                        request_rules();
+                        request_history("1024");
+
+                        scene = RULES;
                     }
 
                     break;
                 }
             }
             else if (e.button == SDL_CONTROLLER_BUTTON_B) {
-                scene = SELECTION_MENU;
-            }
-        }
-        else if (scene == ROOMS_LIST) {
-            if (e.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
-
-                if (selectedRoom > 0)
-                    selectedRoom--;
-            }
-
-            else if (e.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
-
-                if (selectedRoom < roomCount - 1)
-                    selectedRoom++;
-            }
-
-            else if (e.button == SDL_CONTROLLER_BUTTON_A) {
-
-                currentRoom = rooms[selectedRoom].name;
-
-                scene = CHAT;
-            }
-
-            else if (e.button == SDL_CONTROLLER_BUTTON_B) {
-            
                 scene = SELECTION_MENU;
             }
         }
